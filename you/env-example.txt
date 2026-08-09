@@ -1,0 +1,5 @@
+TELEGRAM_BOT_TOKEN=токен_от_BotFather
+OWNER_NAME=Твоё имя
+
+# необязательно — распознавание голосовых сообщений (https://deepgram.com, есть бесплатный лимит)
+# DEEPGRAM_API_KEY=
