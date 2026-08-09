@@ -67,7 +67,7 @@ function callClaude(prompt, sessionId) {
     child.on("error", reject);
     child.on("close", (code) => {
       if (code !== 0 && !answer) return reject(new Error(`Claude exited ${code}: ${stderr.slice(0, 300)}`));
-      resolve({ text: answer || "Не получил ответа, а чтоб мой килт! Попробуй ещё раз.", sessionId: newSessionId });
+      resolve({ text: answer || "Не получил ответа, клянусь своим гроссбухом! Попробуй ещё раз.", sessionId: newSessionId });
     });
     child.stdin.end();
   });
@@ -141,14 +141,14 @@ const welcomeBullets = [
 
 const WELCOME_TEXT = `🎩 Скрудж на связи, ${OWNER_NAME}!
 
-Веду учёт твоих личных денег — так же дотошно, как считал каждый цент, прежде чем он попадал в мой денежный чан.
+Веду учёт твоих личных денег так же дотошно, как считал бы каждый цент в своей приходно-расходной книге.
 
 Что умею:
 ${welcomeBullets.join("\n")}
 
 Просто пиши или присылай — остальное беру на себя. Ничто на свете не пахнет лучше, чем чистые деньги! 🧧`;
 
-const ONBOARDING_TEXT = `А чтоб мой килт, хочешь сразу глянуть, как это работает? 🧐
+const ONBOARDING_TEXT = `Клянусь своим гроссбухом, хочешь сразу глянуть, как это работает? 🧐
 
 Скинь мне траты за прошлый месяц — чеками, голосом или просто текстом, как удобно. А как занесёшь, напиши «дай сводку за прошлый месяц» — покажу, куда уходили деньги, по статьям и с итогом. 💰📊`;
 
@@ -162,7 +162,7 @@ bot.command("summary", async (ctx) => {
   if (!isOwner(ctx)) return;
   const stopTyping = keepTyping(ctx, "typing");
   try { await replyFromClaude(ctx, "Пользователь нажал кнопку меню «Сводка» — дай сводку за текущий месяц."); }
-  catch (error) { console.error("[summary]", error.message); await ctx.reply("А чтоб мой килт! Не смог собрать сводку. Попробуй ещё раз или напиши текстом."); }
+  catch (error) { console.error("[summary]", error.message); await ctx.reply("Клянусь своим гроссбухом! Не смог собрать сводку. Попробуй ещё раз или напиши текстом."); }
   finally { stopTyping(); }
 });
 
@@ -170,7 +170,7 @@ bot.command("status", async (ctx) => {
   if (!isOwner(ctx)) return;
   const stopTyping = keepTyping(ctx, "typing");
   try { await replyFromClaude(ctx, "Пользователь нажал кнопку меню «Статус» — покажи лимиты по статьям и цели накопления."); }
-  catch (error) { console.error("[status]", error.message); await ctx.reply("А чтоб мой килт! Не смог собрать статус. Попробуй ещё раз или напиши текстом."); }
+  catch (error) { console.error("[status]", error.message); await ctx.reply("Клянусь своим гроссбухом! Не смог собрать статус. Попробуй ещё раз или напиши текстом."); }
   finally { stopTyping(); }
 });
 
@@ -183,7 +183,7 @@ bot.on("message:text", async (ctx) => {
   if (!isOwner(ctx)) return;
   const stopTyping = keepTyping(ctx, "typing");
   try { await replyFromClaude(ctx, `Текст от пользователя:\n${ctx.message.text}`); }
-  catch (error) { console.error("[text]", error.message); await ctx.reply("А чтоб мой килт! Не смог обработать запись. Попробуй ещё раз."); }
+  catch (error) { console.error("[text]", error.message); await ctx.reply("Клянусь своим гроссбухом! Не смог обработать запись. Попробуй ещё раз."); }
   finally { stopTyping(); }
 });
 
@@ -204,7 +204,7 @@ bot.on("message:photo", async (ctx) => {
 bot.on("message:voice", async (ctx) => {
   if (!isOwner(ctx)) return;
   if (!process.env.DEEPGRAM_API_KEY) {
-    await ctx.reply("Голосовые распознаю после подключения Deepgram. Опиши трату текстом, а чтоб мой килт! 🎤");
+    await ctx.reply("Голосовые распознаю после подключения Deepgram. Опиши трату текстом, клянусь своим гроссбухом! 🎤");
     return;
   }
   const stopTyping = keepTyping(ctx, "typing");
@@ -214,7 +214,7 @@ bot.on("message:voice", async (ctx) => {
   try {
     await download(`https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`, tempPath);
     const transcript = await transcribeVoice(tempPath);
-    if (!transcript) { await ctx.reply("Не расслышал, а чтоб мой килт! Скажи ещё раз или напиши текстом. 🎤"); return; }
+    if (!transcript) { await ctx.reply("Не расслышал, клянусь своим гроссбухом! Скажи ещё раз или напиши текстом. 🎤"); return; }
     await replyFromClaude(ctx, `Голосовое сообщение (расшифровка): ${transcript}`);
   } catch (error) { console.error("[voice]", error.message); await ctx.reply("Не смог распознать голосовое. Попробуй ещё раз или напиши текстом. 🎤"); }
   finally { stopTyping(); if (existsSync(tempPath)) unlinkSync(tempPath); }
@@ -224,8 +224,8 @@ cron.schedule("0 21 * * *", async () => {
   if (!ownerChatId) return;
   const count = countTransactionsOn(today());
   const message = count === 0
-    ? "🎩 Ничто на свете не пахнет лучше, чем чистые деньги — особенно учтённые. Сегодня записей нет. Скинь все траты, а чтоб мой килт! 💰🧮"
-    : "💰 Вижу записи за сегодня. Все траты скинул? Каждая копейка — как моя монетка Число-Один — на счету. 🧐";
+    ? "🎩 Ничто на свете не пахнет лучше, чем чистые деньги — особенно учтённые. Сегодня записей нет. Скинь все траты, клянусь своим гроссбухом! 💰🧮"
+    : "💰 Вижу записи за сегодня. Все траты скинул? У меня каждая копейка на счету. 🧐";
   await bot.api.sendMessage(ownerChatId, message);
 }, { timezone: Intl.DateTimeFormat().resolvedOptions().timeZone });
 
