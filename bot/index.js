@@ -19,6 +19,12 @@ const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const OWNER_NAME = process.env.OWNER_NAME || "владелец";
 if (!BOT_TOKEN) throw new Error(`TELEGRAM_BOT_TOKEN is missing in ${ENV_PATH}`);
 
+// Напоминания (21:00, разбор целей) должны идти по времени владельца, а не по
+// времени сервера — без OWNER_TZ используется TZ процесса (обычно UTC на VPS),
+// и "21:00" превращается в случайный час ночи для владельца в другом поясе.
+if (process.env.OWNER_TZ) process.env.TZ = process.env.OWNER_TZ;
+const CRON_TZ = Intl.DateTimeFormat().resolvedOptions().timeZone;
+
 const DATA_DIR = join(AGENT_HOME, "data");
 const SESSION_PATH = join(DATA_DIR, "sessions.json");
 mkdirSync(DATA_DIR, { recursive: true });
@@ -227,7 +233,7 @@ cron.schedule("0 21 * * *", async () => {
     ? "🎩 Ничто на свете не пахнет лучше, чем чистые деньги — особенно учтённые. Сегодня записей нет. Скинь все траты, клянусь своим гроссбухом! 💰🧮"
     : "💰 Вижу записи за сегодня. Все траты скинул? У меня каждая копейка на счету. 🧐";
   await bot.api.sendMessage(ownerChatId, message);
-}, { timezone: Intl.DateTimeFormat().resolvedOptions().timeZone });
+}, { timezone: CRON_TZ });
 
 cron.schedule("0 10 1 * *", async () => {
   if (!ownerChatId) return;
@@ -236,7 +242,7 @@ cron.schedule("0 10 1 * *", async () => {
     ? "🎩 Новый месяц — самое время завести цель накопления! На отпуск, технику, что угодно. Скажи, на что и сколько нужно — учту. 💰🧧"
     : `💰 Новый месяц, сверим цели:\n${goals.map((g) => `• ${g.name}: ${g.saved.toLocaleString("ru-RU")} из ${g.targetAmount.toLocaleString("ru-RU")} ₽`).join("\n")}\nОтложил в этом месяце? Напиши сумму — учту. 🧐`;
   await bot.api.sendMessage(ownerChatId, message);
-}, { timezone: Intl.DateTimeFormat().resolvedOptions().timeZone });
+}, { timezone: CRON_TZ });
 
 bot.catch((error) => console.error("[telegram]", error.message));
 
