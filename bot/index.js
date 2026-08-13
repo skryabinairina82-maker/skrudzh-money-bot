@@ -49,10 +49,11 @@ function applyTimezone(tz) {
 }
 let CRON_TZ = applyTimezone(settings.timezone || process.env.OWNER_TZ || Intl.DateTimeFormat().resolvedOptions().timeZone);
 
-// Провайдеры в порядке приоритета. Пока один — claude; codex/kimi добавятся
-// сюда же, когда будут установлены и авторизованы на сервере.
+// Провайдеры в порядке приоритета. Kimi добавится сюда же, когда будет готов
+// Anthropic-совместимый профиль.
 const AGENT_PROVIDERS = [
   { name: "claude", call: (prompt, sessionId) => _callClaudeInner(prompt, sessionId) },
+  { name: "codex", call: (prompt, sessionId) => _callCodexInner(prompt, sessionId) },
 ];
 
 function enqueueClaude(prompt, sessionId) {
@@ -104,6 +105,39 @@ function _callClaudeInner(prompt, sessionId) {
       if (resultIsError) return reject(new Error(answer || stderr.slice(0, 300) || "Claude API error"));
       if (code !== 0 && !answer) return reject(new Error(`Claude exited ${code}: ${stderr.slice(0, 300)}`));
       resolve({ text: answer || "Не получил ответа, клянусь своим гроссбухом! Попробуй ещё раз.", sessionId: newSessionId });
+    });
+    child.stdin.end();
+  });
+}
+
+// Codex как аварийный провайдер: не умеет резюмировать сессию Claude (разные
+// форматы, разные ID), поэтому каждый вызов — самостоятельный, без памяти о
+// предыдущих репликах этого диалога. sessionId прокидывается обратно нетронутым,
+// чтобы не затереть текущую claude-сессию — когда лимит Claude восстановится,
+// резюм пойдёт как ни в чём не бывало. Перенос контекста — отдельная задача.
+function _callCodexInner(prompt, sessionId) {
+  return new Promise((resolve, reject) => {
+    const fullPrompt = `${PERSONA}\n\n${prompt}`;
+    const args = ["exec", fullPrompt, "--json", "--skip-git-repo-check", "--sandbox", "workspace-write"];
+    const child = spawn("codex", args, { cwd: AGENT_HOME, env: process.env, timeout: 600000 });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.on("error", reject);
+    child.on("close", () => {
+      let lastText = "";
+      for (const line of stdout.split("\n")) {
+        if (!line.trim()) continue;
+        try {
+          const event = JSON.parse(line);
+          if (event.type === "item.completed" && event.item?.type === "agent_message" && event.item.text) {
+            lastText = event.item.text;
+          }
+        } catch {}
+      }
+      if (!lastText) return reject(new Error(stderr.slice(0, 300) || "Codex: пустой ответ"));
+      resolve({ text: lastText, sessionId });
     });
     child.stdin.end();
   });

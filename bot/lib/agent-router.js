@@ -9,12 +9,15 @@ import { readFileSync, writeFileSync } from "node:fs";
 
 const DEFAULT_STATE_PATH = "/home/agent/.agent-router-state.json";
 
-// Паттерны подтверждены разбором бинарника @anthropic-ai/claude-code (14.08.2026):
+// Паттерны Claude подтверждены разбором бинарника @anthropic-ai/claude-code (14.08.2026):
 // внутренний классификатор статуса различает "billing_error" (лимит подписки или
 // баланса исчерпан — нужно переключать провайдера) и "rate_limit"/"overloaded"
 // (временное ограничение — просто подождать и повторить у того же провайдера).
-const USAGE_LIMIT_RE = /usage limit reached|billing_error|credit balance.{0,20}too low|usage credit limit|monthly usage limit|group's usage limit/i;
-const RATE_LIMIT_RE = /rate_limit_error|rate limited|overloaded|server_error/i;
+// Паттерны OpenAI/Codex подтверждены реальными ответами API с сервера в тот же день:
+// "no credits remaining" (баланс исчерпан) и "tokens per min (TPM): Limit ..." (TPM-лимит,
+// транзиентный — codex сам ретраит и обычно справляется, но при полном отказе это rate_limit).
+const USAGE_LIMIT_RE = /usage limit reached|billing_error|credit balance.{0,20}too low|usage credit limit|monthly usage limit|group's usage limit|no credits remaining|insufficient_quota/i;
+const RATE_LIMIT_RE = /rate_limit_error|rate limited|overloaded|server_error|rate_limit_exceeded|tokens per min|requests per min/i;
 
 const DEFAULT_COOLDOWN_MS = {
   usage_limit: 5 * 60 * 60 * 1000, // консервативная пауза — лимит подписки Claude сбрасывается максимум раз в 5ч
