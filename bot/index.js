@@ -8,6 +8,7 @@ import https from "node:https";
 import { pipeline } from "node:stream/promises";
 import { createWriteStream } from "node:fs";
 import { initDb, countTransactionsOn, getGoalsWithProgress, closeDb } from "./lib/db.js";
+import { callWithFailover } from "./lib/agent-router.js";
 
 const AGENT_HOME = process.env.AGENT_HOME;
 if (!AGENT_HOME) throw new Error("AGENT_HOME is required");
@@ -48,13 +49,27 @@ function applyTimezone(tz) {
 }
 let CRON_TZ = applyTimezone(settings.timezone || process.env.OWNER_TZ || Intl.DateTimeFormat().resolvedOptions().timeZone);
 
+// Провайдеры в порядке приоритета. Пока один — claude; codex/kimi добавятся
+// сюда же, когда будут установлены и авторизованы на сервере.
+const AGENT_PROVIDERS = [
+  { name: "claude", call: (prompt, sessionId) => _callClaudeInner(prompt, sessionId) },
+];
+
 function enqueueClaude(prompt, sessionId) {
-  const task = queue.then(() => callClaude(prompt, sessionId));
+  const task = queue.then(() => callWithFailover(AGENT_PROVIDERS, prompt, sessionId, {
+    onSwitch: (provider, kind) => {
+      const label = kind === "usage_limit" ? "лимит подписки исчерпан" : "временное ограничение (rate limit)";
+      console.warn(`[agent-router] ${provider}: ${label}`);
+      if (ownerChatId) {
+        bot.api.sendMessage(ownerChatId, `⚠️ ${provider}: ${label}. Других провайдеров пока не подключено — жду восстановления.`).catch(() => {});
+      }
+    },
+  }));
   queue = task.catch(() => {});
   return task;
 }
 
-function callClaude(prompt, sessionId) {
+function _callClaudeInner(prompt, sessionId) {
   return new Promise((resolve, reject) => {
     const args = ["-p", prompt, "--output-format", "stream-json", "--verbose", "--max-turns", "15", "--append-system-prompt", PERSONA, "--dangerously-skip-permissions"];
     if (sessionId) args.push("--resume", sessionId);
@@ -63,6 +78,7 @@ function callClaude(prompt, sessionId) {
     let answer = "";
     let newSessionId = sessionId || null;
     let stderr = "";
+    let resultIsError = false;
     child.stdout.on("data", (chunk) => {
       buffer += chunk;
       const lines = buffer.split("\n");
@@ -74,13 +90,18 @@ function callClaude(prompt, sessionId) {
             const text = event.message?.content?.filter((part) => part.type === "text").map((part) => part.text).join("");
             if (text) answer = text;
           }
-          if (event.type === "result") { answer = event.result || answer; newSessionId = event.session_id || newSessionId; }
+          if (event.type === "result") {
+            if (event.is_error) resultIsError = true;
+            answer = event.result || answer;
+            newSessionId = event.session_id || newSessionId;
+          }
         } catch {}
       }
     });
     child.stderr.on("data", (chunk) => { stderr += chunk; });
     child.on("error", reject);
     child.on("close", (code) => {
+      if (resultIsError) return reject(new Error(answer || stderr.slice(0, 300) || "Claude API error"));
       if (code !== 0 && !answer) return reject(new Error(`Claude exited ${code}: ${stderr.slice(0, 300)}`));
       resolve({ text: answer || "Не получил ответа, клянусь своим гроссбухом! Попробуй ещё раз.", sessionId: newSessionId });
     });
