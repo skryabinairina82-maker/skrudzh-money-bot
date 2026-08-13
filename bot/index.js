@@ -49,12 +49,16 @@ function applyTimezone(tz) {
 }
 let CRON_TZ = applyTimezone(settings.timezone || process.env.OWNER_TZ || Intl.DateTimeFormat().resolvedOptions().timeZone);
 
-// Провайдеры в порядке приоритета. Kimi добавится сюда же, когда будет готов
-// Anthropic-совместимый профиль.
+// Провайдеры в порядке приоритета.
 const AGENT_PROVIDERS = [
   { name: "claude", call: (prompt, sessionId) => _callClaudeInner(prompt, sessionId) },
   { name: "codex", call: (prompt, sessionId) => _callCodexInner(prompt, sessionId) },
+  { name: "kimi", call: (prompt, sessionId) => _callKimiInner(prompt, sessionId) },
 ];
+
+// Общий на всех ботов файл с ключом Moonshot (Kimi K2) — тот же принцип, что и у
+// копий Claude-креда: одна подписка/ключ на всех агентов сервера.
+const KIMI_KEY_PATH = "/home/agent/.kimi-api-key";
 
 function enqueueClaude(prompt, sessionId) {
   const task = queue.then(() => callWithFailover(AGENT_PROVIDERS, prompt, sessionId, {
@@ -138,6 +142,45 @@ function _callCodexInner(prompt, sessionId) {
       }
       if (!lastText) return reject(new Error(stderr.slice(0, 300) || "Codex: пустой ответ"));
       resolve({ text: lastText, sessionId });
+    });
+    child.stdin.end();
+  });
+}
+
+// Kimi K2 через Anthropic-совместимый endpoint Moonshot — тот же бинарник claude,
+// но с --bare (иначе CLI попробует OAuth-подписку вместо ключа) и переключённым
+// ANTHROPIC_BASE_URL/ANTHROPIC_API_KEY.
+function _callKimiInner(prompt, sessionId) {
+  return new Promise((resolve, reject) => {
+    let kimiKey;
+    try {
+      kimiKey = readFileSync(KIMI_KEY_PATH, "utf8").trim();
+    } catch {
+      return reject(new Error("Kimi: ключ не найден (" + KIMI_KEY_PATH + ")"));
+    }
+    if (!kimiKey) return reject(new Error("Kimi: пустой ключ в " + KIMI_KEY_PATH));
+
+    const fullPrompt = `${PERSONA}\n\n${prompt}`;
+    const args = ["--bare", "-p", fullPrompt, "--output-format", "json", "--model", "kimi-k2.6"];
+    const child = spawn("claude", args, {
+      cwd: AGENT_HOME,
+      env: { ...process.env, ANTHROPIC_BASE_URL: "https://api.moonshot.ai/anthropic", ANTHROPIC_API_KEY: kimiKey },
+      timeout: 600000,
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      if (code !== 0 && !stdout.trim()) return reject(new Error(`Kimi exit ${code}: ${stderr.slice(0, 300)}`));
+      try {
+        const result = JSON.parse(stdout);
+        if (result.is_error) return reject(new Error(result.result || stderr.slice(0, 300) || "Kimi API error"));
+        resolve({ text: result.result || result.text || "(пустой ответ)", sessionId });
+      } catch {
+        resolve({ text: stdout.trim() || "(пустой ответ)", sessionId });
+      }
     });
     child.stdin.end();
   });
