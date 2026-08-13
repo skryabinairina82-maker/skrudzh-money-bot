@@ -1,5 +1,6 @@
-import { Bot, InputFile } from "grammy";
+import { Bot, InputFile, Keyboard } from "grammy";
 import cron from "node-cron";
+import tzlookup from "tz-lookup";
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -19,25 +20,33 @@ const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const OWNER_NAME = process.env.OWNER_NAME || "владелец";
 if (!BOT_TOKEN) throw new Error(`TELEGRAM_BOT_TOKEN is missing in ${ENV_PATH}`);
 
-// Напоминания (21:00, разбор целей) должны идти по времени владельца, а не по
-// времени сервера — без OWNER_TZ используется TZ процесса (обычно UTC на VPS),
-// и "21:00" превращается в случайный час ночи для владельца в другом поясе.
-if (process.env.OWNER_TZ) process.env.TZ = process.env.OWNER_TZ;
-const CRON_TZ = Intl.DateTimeFormat().resolvedOptions().timeZone;
-
 const DATA_DIR = join(AGENT_HOME, "data");
 const SESSION_PATH = join(DATA_DIR, "sessions.json");
+const SETTINGS_PATH = join(DATA_DIR, "settings.json");
 mkdirSync(DATA_DIR, { recursive: true });
 
 const PERSONA = readFileSync(join(import.meta.dirname, "persona.md"), "utf8");
 
 let sessions = {};
 try { sessions = JSON.parse(readFileSync(SESSION_PATH, "utf8")); } catch {}
+let settings = {};
+try { settings = JSON.parse(readFileSync(SETTINGS_PATH, "utf8")); } catch {}
 let ownerChatId = null;
 let queue = Promise.resolve();
 
 function saveSessions() { writeFileSync(SESSION_PATH, JSON.stringify(sessions, null, 2)); }
-function today() { return new Intl.DateTimeFormat("en-CA").format(new Date()); }
+function saveSettings() { writeFileSync(SETTINGS_PATH, JSON.stringify(settings, null, 2)); }
+function today() { return new Intl.DateTimeFormat("en-CA", { timeZone: CRON_TZ }).format(new Date()); }
+
+// Напоминания (21:00, разбор целей) должны идти по времени владельца, а не сервера.
+// Приоритет: геопозиция (settings.timezone, определяется командой /timezone через
+// tz-lookup) → OWNER_TZ в .env как ручной запасной вариант → часовой пояс сервера,
+// если не задано ничего (на VPS это обычно UTC — почти наверняка не то, что нужно).
+function applyTimezone(tz) {
+  process.env.TZ = tz;
+  return Intl.DateTimeFormat().resolvedOptions().timeZone;
+}
+let CRON_TZ = applyTimezone(settings.timezone || process.env.OWNER_TZ || Intl.DateTimeFormat().resolvedOptions().timeZone);
 
 function enqueueClaude(prompt, sessionId) {
   const task = queue.then(() => callClaude(prompt, sessionId));
@@ -142,7 +151,7 @@ const welcomeBullets = [
   "🎯 Цели накопления — заведи цель, отмечай взносы, сверим 1 числа",
   "📊 Спроси «сводку за неделю» или «за месяц» — покажу расходы и доходы по статьям, картинку-график и сальдо (доход минус расход)",
   "🗂️ Статьи уже заведены, но если понадобится своя — просто скажи, заведём вместе",
-  "🌙 Вечером в 21:00 спрошу, все ли траты скинул за день",
+  "🌙 Вечером в 21:00 спрошу, все ли траты скинул за день (по твоему часовому поясу)",
 ];
 
 const WELCOME_TEXT = `🎩 Скрудж на связи, ${OWNER_NAME}!
@@ -158,10 +167,38 @@ const ONBOARDING_TEXT = `Клянусь своим гроссбухом, хоч�
 
 Скинь мне траты за прошлый месяц — чеками, голосом или просто текстом, как удобно. А как занесёшь, напиши «дай сводку за прошлый месяц» — покажу, куда уходили деньги, по статьям и с итогом. 💰📊`;
 
+async function promptTimezone(ctx) {
+  const keyboard = new Keyboard().requestLocation("📍 Поделиться геопозицией").resized().oneTime();
+  await ctx.reply("Поделись геопозицией — определю часовой пояс, чтобы вечернее напоминание и разбор целей приходили вовремя, а не среди ночи. 🧭", { reply_markup: keyboard });
+}
+
 bot.command("start", async (ctx) => {
   if (!isOwner(ctx)) return;
   await ctx.reply(WELCOME_TEXT);
   await ctx.reply(ONBOARDING_TEXT);
+  if (!settings.timezone) await promptTimezone(ctx);
+});
+
+bot.command("timezone", async (ctx) => {
+  if (!isOwner(ctx)) return;
+  await promptTimezone(ctx);
+});
+
+bot.on("message:location", async (ctx) => {
+  if (!isOwner(ctx)) return;
+  const { latitude, longitude } = ctx.message.location;
+  let tz;
+  try { tz = tzlookup(latitude, longitude); }
+  catch {
+    await ctx.reply("Не смог определить часовой пояс по этим координатам. Попробуй ещё раз или впиши OWNER_TZ вручную в .env.", { reply_markup: { remove_keyboard: true } });
+    return;
+  }
+  settings.timezone = tz;
+  saveSettings();
+  CRON_TZ = applyTimezone(tz);
+  scheduleReminders(CRON_TZ);
+  const localTime = new Intl.DateTimeFormat("ru-RU", { timeZone: tz, hour: "2-digit", minute: "2-digit" }).format(new Date());
+  await ctx.reply(`🎩 Записал: часовой пояс ${tz}, у тебя сейчас ${localTime}. Вечернее напоминание и разбор целей теперь по этому времени. Переедешь в другой пояс — просто пришли /timezone ещё раз. 💰`, { reply_markup: { remove_keyboard: true } });
 });
 
 bot.command("summary", async (ctx) => {
@@ -226,23 +263,33 @@ bot.on("message:voice", async (ctx) => {
   finally { stopTyping(); if (existsSync(tempPath)) unlinkSync(tempPath); }
 });
 
-cron.schedule("0 21 * * *", async () => {
-  if (!ownerChatId) return;
-  const count = countTransactionsOn(today());
-  const message = count === 0
-    ? "🎩 Ничто на свете не пахнет лучше, чем чистые деньги — особенно учтённые. Сегодня записей нет. Скинь все траты, клянусь своим гроссбухом! 💰🧮"
-    : "💰 Вижу записи за сегодня. Все траты скинул? У меня каждая копейка на счету. 🧐";
-  await bot.api.sendMessage(ownerChatId, message);
-}, { timezone: CRON_TZ });
+// Обёрнуто в функцию, чтобы можно было пересобрать задачи на новый часовой пояс
+// после /timezone — node-cron не даёт поменять timezone у уже созданной задачи,
+// только остановить старую и создать новую.
+let reminderTasks = [];
+function scheduleReminders(tz) {
+  for (const task of reminderTasks) task.stop();
+  reminderTasks = [
+    cron.schedule("0 21 * * *", async () => {
+      if (!ownerChatId) return;
+      const count = countTransactionsOn(today());
+      const message = count === 0
+        ? "🎩 Ничто на свете не пахнет лучше, чем чистые деньги — особенно учтённые. Сегодня записей нет. Скинь все траты, клянусь своим гроссбухом! 💰🧮"
+        : "💰 Вижу записи за сегодня. Все траты скинул? У меня каждая копейка на счету. 🧐";
+      await bot.api.sendMessage(ownerChatId, message);
+    }, { timezone: tz }),
 
-cron.schedule("0 10 1 * *", async () => {
-  if (!ownerChatId) return;
-  const goals = getGoalsWithProgress();
-  const message = goals.length === 0
-    ? "🎩 Новый месяц — самое время завести цель накопления! На отпуск, технику, что угодно. Скажи, на что и сколько нужно — учту. 💰🧧"
-    : `💰 Новый месяц, сверим цели:\n${goals.map((g) => `• ${g.name}: ${g.saved.toLocaleString("ru-RU")} из ${g.targetAmount.toLocaleString("ru-RU")} ₽`).join("\n")}\nОтложил в этом месяце? Напиши сумму — учту. 🧐`;
-  await bot.api.sendMessage(ownerChatId, message);
-}, { timezone: CRON_TZ });
+    cron.schedule("0 10 1 * *", async () => {
+      if (!ownerChatId) return;
+      const goals = getGoalsWithProgress();
+      const message = goals.length === 0
+        ? "🎩 Новый месяц — самое время завести цель накопления! На отпуск, технику, что угодно. Скажи, на что и сколько нужно — учту. 💰🧧"
+        : `💰 Новый месяц, сверим цели:\n${goals.map((g) => `• ${g.name}: ${g.saved.toLocaleString("ru-RU")} из ${g.targetAmount.toLocaleString("ru-RU")} ₽`).join("\n")}\nОтложил в этом месяце? Напиши сумму — учту. 🧐`;
+      await bot.api.sendMessage(ownerChatId, message);
+    }, { timezone: tz }),
+  ];
+}
+scheduleReminders(CRON_TZ);
 
 bot.catch((error) => console.error("[telegram]", error.message));
 
@@ -251,6 +298,7 @@ await bot.api.setMyCommands([
   { command: "start", description: "Познакомиться со мной" },
   { command: "summary", description: "Сводка за месяц" },
   { command: "status", description: "Лимиты и цели" },
+  { command: "timezone", description: "Обновить часовой пояс" },
   { command: "help", description: "Что я умею" },
 ]);
 process.once("SIGINT", () => { closeDb(); bot.stop(); });
