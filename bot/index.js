@@ -9,7 +9,7 @@ import { pipeline } from "node:stream/promises";
 import { createWriteStream } from "node:fs";
 import { initDb, countTransactionsOn, getGoalsWithProgress, closeDb } from "./lib/db.js";
 import { callWithFailover } from "./lib/agent-router.js";
-import { load as loadDialogHistory, save as saveDialogHistory, getGap, formatGapBlock, recordTurn } from "./lib/dialog-history.js";
+import { load as loadDialogHistory, save as saveDialogHistory, getGap, getWindow, formatGapBlock, recordTurn } from "./lib/dialog-history.js";
 
 const AGENT_HOME = process.env.AGENT_HOME;
 if (!AGENT_HOME) throw new Error("AGENT_HOME is required");
@@ -134,12 +134,13 @@ function _callClaudeInner(prompt, sessionId, { userId } = {}) {
 // Codex как аварийный провайдер: не умеет резюмировать сессию Claude (разные
 // форматы, разные ID) — sessionId прокидывается обратно нетронутым, чтобы не
 // затереть текущую claude-сессию: когда лимит Claude восстановится, резюм
-// пойдёт как ни в чём не бывало. Провал в памяти внутри самого диалога
-// закрываем текстом — gapBlock из dialog-history.js с недавними репликами,
-// которые codex иначе не увидел бы.
+// пойдёт как ни в чём не бывало. Сам codex при этом полностью stateless между
+// вызовами (каждый `codex exec` — новый процесс без памяти о своих же прошлых
+// ответах), поэтому текстом отдаём ВСЁ окно целиком (getWindow), а не только
+// пропуск — иначе на втором ходу подряд codex забудет то, что сам ответил.
 function _callCodexInner(prompt, sessionId, { userId } = {}) {
   return new Promise((resolve, reject) => {
-    const gapBlock = userId ? formatGapBlock(getGap(dialogHistory, userId, "codex")) : "";
+    const gapBlock = userId ? formatGapBlock(getWindow(dialogHistory, userId)) : "";
     const fullPrompt = `${PERSONA}\n\n${gapBlock}${prompt}`;
     const args = ["exec", fullPrompt, "--json", "--skip-git-repo-check", "--sandbox", "workspace-write"];
     const child = spawn("codex", args, { cwd: AGENT_HOME, env: process.env, timeout: 600000 });
@@ -168,9 +169,9 @@ function _callCodexInner(prompt, sessionId, { userId } = {}) {
 
 // Kimi K2 через Anthropic-совместимый endpoint Moonshot — тот же бинарник claude,
 // но с --bare (иначе CLI попробует OAuth-подписку вместо ключа) и переключённым
-// ANTHROPIC_BASE_URL/ANTHROPIC_API_KEY. Как и codex, без переноса нативной
-// сессии между провайдерами — провал в памяти закрываем текстовым gapBlock
-// из dialog-history.js.
+// ANTHROPIC_BASE_URL/ANTHROPIC_API_KEY. Как и codex, полностью stateless между
+// вызовами (сессий вообще нет) — текстом отдаём ВСЁ окно целиком (getWindow),
+// а не только пропуск.
 function _callKimiInner(prompt, sessionId, { userId } = {}) {
   return new Promise((resolve, reject) => {
     let kimiKey;
@@ -181,7 +182,7 @@ function _callKimiInner(prompt, sessionId, { userId } = {}) {
     }
     if (!kimiKey) return reject(new Error("Kimi: пустой ключ в " + KIMI_KEY_PATH));
 
-    const gapBlock = userId ? formatGapBlock(getGap(dialogHistory, userId, "kimi")) : "";
+    const gapBlock = userId ? formatGapBlock(getWindow(dialogHistory, userId)) : "";
     const fullPrompt = `${PERSONA}\n\n${gapBlock}${prompt}`;
     const args = ["--bare", "-p", fullPrompt, "--output-format", "json", "--model", "kimi-k2.7-code"];
     const child = spawn("claude", args, {

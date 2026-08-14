@@ -51,15 +51,24 @@ function pruneWindow(user) {
 }
 
 // Реплики, которые provider ещё не видел — seq больше отметки его последнего
-// успешного ответа этому пользователю. У провайдера, который отвечал последним,
-// gap пустой (не тратим токены зря); у того, кто был на cooldown — содержит всё,
-// что случилось без него, в том числе при возврате на "родного" провайдера с
-// --resume/thread_id, который не в курсе, что происходило в его отсутствие.
+// успешного ответа этому пользователю. Имеет смысл ТОЛЬКО для провайдера с
+// настоящей нативной сессией (claude --resume): он и так помнит всё до своего
+// последнего ответа, нужен лишь пропуск — что случилось, пока отвечали другие.
+// Для stateless-провайдеров (codex exec без resume, kimi без сессий вообще)
+// используй getWindow — они не помнят даже свои же прошлые ответы.
 function getGap(state, userId, provider) {
   const user = state[userId];
   if (!user) return [];
   const lastSeen = user.providerSeq[provider] || 0;
   return user.turns.filter((t) => t.seq > lastSeen);
+}
+
+// Всё окно целиком — для провайдеров без собственной памяти между вызовами.
+// В отличие от getGap, не смотрит на providerSeq: даже если этот провайдер
+// отвечал прошлым ходом, к следующему вызову он это уже забыл.
+function getWindow(state, userId) {
+  const user = state[userId];
+  return user ? user.turns : [];
 }
 
 function formatGapBlock(gap) {
@@ -80,4 +89,4 @@ function recordTurn(state, userId, provider, userText, assistantText) {
   user.providerSeq[provider] = user.seq;
 }
 
-export { load, save, getGap, formatGapBlock, recordTurn };
+export { load, save, getGap, getWindow, formatGapBlock, recordTurn };
