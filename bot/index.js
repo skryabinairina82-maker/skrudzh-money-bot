@@ -9,6 +9,7 @@ import { pipeline } from "node:stream/promises";
 import { createWriteStream } from "node:fs";
 import { initDb, countTransactionsOn, getGoalsWithProgress, closeDb } from "./lib/db.js";
 import { callWithFailover } from "./lib/agent-router.js";
+import { load as loadDialogHistory, save as saveDialogHistory, getGap, formatGapBlock, recordTurn } from "./lib/dialog-history.js";
 
 const AGENT_HOME = process.env.AGENT_HOME;
 if (!AGENT_HOME) throw new Error("AGENT_HOME is required");
@@ -24,6 +25,7 @@ if (!BOT_TOKEN) throw new Error(`TELEGRAM_BOT_TOKEN is missing in ${ENV_PATH}`);
 const DATA_DIR = join(AGENT_HOME, "data");
 const SESSION_PATH = join(DATA_DIR, "sessions.json");
 const SETTINGS_PATH = join(DATA_DIR, "settings.json");
+const DIALOG_HISTORY_PATH = join(DATA_DIR, "dialog-history.json");
 mkdirSync(DATA_DIR, { recursive: true });
 
 const PERSONA = readFileSync(join(import.meta.dirname, "persona.md"), "utf8");
@@ -32,6 +34,7 @@ let sessions = {};
 try { sessions = JSON.parse(readFileSync(SESSION_PATH, "utf8")); } catch {}
 let settings = {};
 try { settings = JSON.parse(readFileSync(SETTINGS_PATH, "utf8")); } catch {}
+const dialogHistory = loadDialogHistory(DIALOG_HISTORY_PATH);
 let ownerChatId = null;
 let queue = Promise.resolve();
 
@@ -51,32 +54,46 @@ let CRON_TZ = applyTimezone(settings.timezone || process.env.OWNER_TZ || Intl.Da
 
 // Провайдеры в порядке приоритета.
 const AGENT_PROVIDERS = [
-  { name: "claude", call: (prompt, sessionId) => _callClaudeInner(prompt, sessionId) },
-  { name: "codex", call: (prompt, sessionId) => _callCodexInner(prompt, sessionId) },
-  { name: "kimi", call: (prompt, sessionId) => _callKimiInner(prompt, sessionId) },
+  { name: "claude", call: (prompt, sessionId, opts) => _callClaudeInner(prompt, sessionId, opts) },
+  { name: "codex", call: (prompt, sessionId, opts) => _callCodexInner(prompt, sessionId, opts) },
+  { name: "kimi", call: (prompt, sessionId, opts) => _callKimiInner(prompt, sessionId, opts) },
 ];
 
 // Общий на всех ботов файл с ключом Moonshot (Kimi K2) — тот же принцип, что и у
 // копий Claude-креда: одна подписка/ключ на всех агентов сервера.
 const KIMI_KEY_PATH = "/home/agent/.kimi-api-key";
 
-function enqueueClaude(prompt, sessionId) {
-  const task = queue.then(() => callWithFailover(AGENT_PROVIDERS, prompt, sessionId, {
-    onSwitch: (provider, kind) => {
-      const label = kind === "usage_limit" ? "лимит подписки исчерпан" : "временное ограничение (rate limit)";
-      console.warn(`[agent-router] ${provider}: ${label}`);
-      if (ownerChatId) {
-        bot.api.sendMessage(ownerChatId, `⚠️ ${provider}: ${label}. Других провайдеров пока не подключено — жду восстановления.`).catch(() => {});
-      }
-    },
-  }));
+function enqueueClaude(prompt, sessionId, userId) {
+  const task = queue.then(async () => {
+    const result = await callWithFailover(AGENT_PROVIDERS, prompt, sessionId, {
+      userId,
+      onSwitch: (provider, kind) => {
+        const label = kind === "usage_limit" ? "лимит подписки исчерпан" : "временное ограничение (rate limit)";
+        console.warn(`[agent-router] ${provider}: ${label}`);
+        if (ownerChatId) {
+          bot.api.sendMessage(ownerChatId, `⚠️ ${provider}: ${label}. Других провайдеров пока не подключено — жду восстановления.`).catch(() => {});
+        }
+      },
+    });
+    // Provider-agnostic лог диалога — независимо от того, кто ответил, чтобы
+    // при следующем переключении провайдера новый увидел, что было сказано.
+    if (userId) {
+      recordTurn(dialogHistory, userId, result.provider, prompt, result.text);
+      saveDialogHistory(dialogHistory, DIALOG_HISTORY_PATH);
+    }
+    return result;
+  });
   queue = task.catch(() => {});
   return task;
 }
 
-function _callClaudeInner(prompt, sessionId) {
+function _callClaudeInner(prompt, sessionId, { userId } = {}) {
   return new Promise((resolve, reject) => {
-    const args = ["-p", prompt, "--output-format", "stream-json", "--verbose", "--max-turns", "15", "--append-system-prompt", PERSONA, "--dangerously-skip-permissions"];
+    // Пусто в обычном режиме — заполняется, только если claude только что
+    // вернулся из cooldown и пропустил реплики, пока отвечали codex/kimi.
+    const gapBlock = userId ? formatGapBlock(getGap(dialogHistory, userId, "claude")) : "";
+    const fullPrompt = gapBlock + prompt;
+    const args = ["-p", fullPrompt, "--output-format", "stream-json", "--verbose", "--max-turns", "15", "--append-system-prompt", PERSONA, "--dangerously-skip-permissions"];
     if (sessionId) args.push("--resume", sessionId);
     const child = spawn("claude", args, { cwd: AGENT_HOME, env: process.env, timeout: 600000 });
     let buffer = "";
@@ -115,13 +132,15 @@ function _callClaudeInner(prompt, sessionId) {
 }
 
 // Codex как аварийный провайдер: не умеет резюмировать сессию Claude (разные
-// форматы, разные ID), поэтому каждый вызов — самостоятельный, без памяти о
-// предыдущих репликах этого диалога. sessionId прокидывается обратно нетронутым,
-// чтобы не затереть текущую claude-сессию — когда лимит Claude восстановится,
-// резюм пойдёт как ни в чём не бывало. Перенос контекста — отдельная задача.
-function _callCodexInner(prompt, sessionId) {
+// форматы, разные ID) — sessionId прокидывается обратно нетронутым, чтобы не
+// затереть текущую claude-сессию: когда лимит Claude восстановится, резюм
+// пойдёт как ни в чём не бывало. Провал в памяти внутри самого диалога
+// закрываем текстом — gapBlock из dialog-history.js с недавними репликами,
+// которые codex иначе не увидел бы.
+function _callCodexInner(prompt, sessionId, { userId } = {}) {
   return new Promise((resolve, reject) => {
-    const fullPrompt = `${PERSONA}\n\n${prompt}`;
+    const gapBlock = userId ? formatGapBlock(getGap(dialogHistory, userId, "codex")) : "";
+    const fullPrompt = `${PERSONA}\n\n${gapBlock}${prompt}`;
     const args = ["exec", fullPrompt, "--json", "--skip-git-repo-check", "--sandbox", "workspace-write"];
     const child = spawn("codex", args, { cwd: AGENT_HOME, env: process.env, timeout: 600000 });
     let stdout = "";
@@ -149,8 +168,10 @@ function _callCodexInner(prompt, sessionId) {
 
 // Kimi K2 через Anthropic-совместимый endpoint Moonshot — тот же бинарник claude,
 // но с --bare (иначе CLI попробует OAuth-подписку вместо ключа) и переключённым
-// ANTHROPIC_BASE_URL/ANTHROPIC_API_KEY.
-function _callKimiInner(prompt, sessionId) {
+// ANTHROPIC_BASE_URL/ANTHROPIC_API_KEY. Как и codex, без переноса нативной
+// сессии между провайдерами — провал в памяти закрываем текстовым gapBlock
+// из dialog-history.js.
+function _callKimiInner(prompt, sessionId, { userId } = {}) {
   return new Promise((resolve, reject) => {
     let kimiKey;
     try {
@@ -160,7 +181,8 @@ function _callKimiInner(prompt, sessionId) {
     }
     if (!kimiKey) return reject(new Error("Kimi: пустой ключ в " + KIMI_KEY_PATH));
 
-    const fullPrompt = `${PERSONA}\n\n${prompt}`;
+    const gapBlock = userId ? formatGapBlock(getGap(dialogHistory, userId, "kimi")) : "";
+    const fullPrompt = `${PERSONA}\n\n${gapBlock}${prompt}`;
     const args = ["--bare", "-p", fullPrompt, "--output-format", "json", "--model", "kimi-k2.7-code"];
     const child = spawn("claude", args, {
       cwd: AGENT_HOME,
@@ -197,7 +219,7 @@ const PHOTO_TAG = /\[ФОТО:\s*(\S+)(?:\s+([^\]]*))?\]/g;
 
 async function replyFromClaude(ctx, prompt) {
   const userId = String(ctx.from.id);
-  const result = await enqueueClaude(prompt, sessions[userId] || null);
+  const result = await enqueueClaude(prompt, sessions[userId] || null, userId);
   if (result.sessionId) { sessions[userId] = result.sessionId; saveSessions(); }
 
   const photos = [...result.text.matchAll(PHOTO_TAG)].map(([, path, caption]) => ({ path, caption: caption?.trim() || undefined }));
