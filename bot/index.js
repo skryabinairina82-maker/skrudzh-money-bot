@@ -161,7 +161,7 @@ function _callKimiInner(prompt, sessionId) {
     if (!kimiKey) return reject(new Error("Kimi: пустой ключ в " + KIMI_KEY_PATH));
 
     const fullPrompt = `${PERSONA}\n\n${prompt}`;
-    const args = ["--bare", "-p", fullPrompt, "--output-format", "json", "--model", "kimi-k2.6"];
+    const args = ["--bare", "-p", fullPrompt, "--output-format", "json", "--model", "kimi-k2.7-code"];
     const child = spawn("claude", args, {
       cwd: AGENT_HOME,
       env: { ...process.env, ANTHROPIC_BASE_URL: "https://api.moonshot.ai/anthropic", ANTHROPIC_API_KEY: kimiKey },
